@@ -16,3 +16,6 @@ tests/out/
 
 # Private docs
 docs/
+
+# Claude Code local instructions
+CLAUDE.md

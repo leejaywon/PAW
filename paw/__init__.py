@@ -110,7 +110,7 @@ class Rect:
         return hash(tuple(self))
 
     def __lt__(self, other):                 # sortable: reading order-ish (y, x)
-        return (self.y0, self.x0, self.y1, self.x1) <                (other.y0, other.x0, other.y1, other.x1)
+        return (self.y0, self.x0, self.y1, self.x1) < (other.y0, other.x0, other.y1, other.x1)
 
     def __repr__(self):
         return (f"Rect({self.x0:.4g}, {self.y0:.4g}, "
@@ -490,7 +490,7 @@ class Page:
         with _PDFIUM:
             pdf = pdfium.PdfDocument(self.doc._bytes)
             try:
-                img = pdf[self.index].render(scale=dpi / 72, **kw)                     .to_pil().convert("RGB")
+                img = pdf[self.index].render(scale=dpi / 72, **kw).to_pil().convert("RGB")
             finally:
                 pdf.close()
         if clip is None:
@@ -576,7 +576,8 @@ class Page:
                         tp.raw, i, *(ctypes.byref(v) for v in (l, t, r, b)))
                     frags.append([l.value, H - t.value, r.value, H - b.value])
                 # Loose char boxes carry the FONT-METRIC vertical extent —
-                # measured identical to the numbers the layout fitter's heuristics were tuned against
+                # measured identical to the numbers
+                # the layout fitter's heuristics were tuned against
                 # (tight/ink tops sat up to 0.4em lower and skewed every placement built on them).
                 loose = []
                 for i in range(_fp.FPDFText_CountChars(tp.raw)):
