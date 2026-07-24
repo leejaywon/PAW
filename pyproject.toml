@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paw"
+version = "0.2.0"
+description = "PDF Architecture Wizard — layout surgery for PDFs on a fully permissive stack"
+requires-python = ">=3.11"
+# Every dependency is permissively licensed and usable in a closed-source
+# commercial product; see NOTICE for the per-package licences (pikepdf is
+# MPL-2.0: file-level copyleft — fine to use, do not fork privately).
+dependencies = [
+    "pypdfium2",    # BSD-3 / Apache-2.0 — render · object-level erase
+    "pikepdf",      # MPL-2.0           — structure · overlay merge · subset
+    "reportlab",    # BSD-3             — text/vector drawing, TTF subset+embed
+    "pdfplumber",   # MIT               — spans · strokes/fills · images
+    "pillow",       # MIT-CMU           — raster handling
+    "fonttools",    # MIT               — glyph-coverage queries (Font.covers)
+]
+
+[tool.setuptools.packages.find]
+include = ["paw*"]

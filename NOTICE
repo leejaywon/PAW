@@ -1,0 +1,13 @@
+PAW — PDF Architecture Wizard
+
+Third-party components (runtime):
+
+pypdfium2 — BSD-3-Clause / Apache-2.0 (bundles PDFium: BSD-3-Clause)
+pikepdf — MPL-2.0 (file-level copyleft; unmodified — source at https://github.com/pikepdf/pikepdf)
+reportlab — BSD-3-Clause
+pdfplumber — MIT (depends on pdfminer.six, MIT)
+Pillow — MIT-CMU
+fontTools — MIT
+
+Fonts are NOT bundled. Consumers supply their own
+(e.g. Noto Sans CJK KR, OFL-1.1 — embedding in output documents is permitted by that licence).

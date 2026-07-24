@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Generated test outputs
+tests/out/
+
+# Private docs
+docs/
