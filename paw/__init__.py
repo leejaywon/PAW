@@ -792,46 +792,68 @@ class Page:
 
     # ── erasers ──
     def erase_text(self, region: tuple) -> dict:
-        """Remove text objects fully inside `region` from the content stream.
+        """Remove the text touching `region` from the content stream.
 
-        Path A: object-level removal via pdfium.
-        Anything only PARTIALLY inside is left alone and counted in `skipped` —
-        splitting those is Path B (TJ rewrite) and lands here when a real document needs it.
-        Never destructive to art:
-        only FPDF_PAGEOBJ_TEXT is touched.
+        Show operators are rewritten at glyph precision: an erased glyph becomes a kern of the same
+        advance, so surviving text does not move, and every other operator is re-emitted unchanged.
+        Leaving the rest of the stream alone is the whole point of doing it this way.
+        The object-level route (pdfium removal) has to call FPDFPage_GenerateContent afterwards, and
+        that regeneration re-encodes colour through pdfium's own model: a page painted in CMYK,
+        Separation/DeviceN or a shading pattern comes back solid black, from a single object removed.
+        Print-ready documents are precisely the ones painted that way, and they are most of what gets
+        translated, so that route is gone from this path — `erase_art` still uses it, on pages whose
+        art is being removed anyway.
+        The coverage limit is text inside a Form XObject, which the walker does not descend into.
+        Object-level removal never reached it either (pdfium enumerates page objects only, which is
+        why FPDFFormObj_* exists), so nothing regressed by dropping it — but it is now REPORTED in
+        `unreachable` rather than silently left behind.
         """
-        r = self._erase(region, kinds=(_fp.FPDF_PAGEOBJ_TEXT,))
-        if r["skipped"]:
-            # Path B: show operators STRADDLING the region survive the object pass;
-            # rewrite them at glyph precision —
-            # erased glyphs become kerns of the same advance,
-            # so survivors do not move.
-            from . import _textstream
-            _, H = self.size
-            regions = ([tuple(x) for x in region]
-                       if region and isinstance(region[0], (tuple, list, Rect))
-                       else [tuple(region)])
-            flipped = [(x0, H - y1, x1, H - y0) for x0, y0, x1, y1 in regions]
-            new_bytes, bstats = _textstream.erase_glyphs(
-                self.doc._bytes, self.index, flipped)
-            if bstats["ops_rewritten"]:
-                self.doc._bytes = new_bytes
-            r |= {"glyphs": bstats["glyphs"],
-                  "ops_rewritten": bstats["ops_rewritten"],
-                  "xobject_ops": bstats["xobject_ops"]}
-        return r
+        self.doc._flush()   # operations apply strictly in call order
+        _, H = self.size
+        regions = ([tuple(x) for x in region]
+                   if region and isinstance(region[0], (tuple, list, Rect))
+                   else [tuple(region)])
+        flipped = [(x0, H - y1, x1, H - y0) for x0, y0, x1, y1 in regions]
+
+        from . import _textstream
+        new_bytes, stats = _textstream.erase_glyphs(self.doc._bytes, self.index, flipped)
+        if stats["ops_rewritten"]:
+            self.doc._bytes = new_bytes
+        return {"removed": stats["glyphs"], "skipped": 0,
+                "unreachable": stats["form_xobject_ops"], **stats}
 
     def erase_art(self, region: tuple) -> dict:
         """Remove path objects (rules, highlight bars) fully covered by `region`.
 
         The second erase engine — the pass the first migration estimate missed.
-        Same object-level mechanism as erase_text but aimed at FPDF_PAGEOBJ_PATH.
+        Object-level removal aimed at FPDF_PAGEOBJ_PATH.
         A path object that extends beyond the region
         (e.g. one object drawing a whole table grid)
         is conservatively kept and counted in `skipped` —
         subpath splitting is future precision work.
+
+        Removal makes pdfium regenerate the content stream, which re-encodes colour through its own
+        model, so on a page painted in CMYK, Separation/DeviceN or a shading every fill on it turns
+        black — the whole page lost to remove one rule. Those pages are refused instead, reported as
+        `fragile_color`: an underline left standing is a blemish, a black page is the document gone.
+        Erasing art through the stream walker the way `erase_text` does would lift the restriction.
         """
+        self.doc._flush()
+        if self._fragile_color():
+            return {"removed": 0, "skipped": 0, "fragile_color": True}
         return self._erase(region, kinds=(_fp.FPDF_PAGEOBJ_PATH,))
+
+    def _fragile_color(self) -> bool:
+        """Cached: does this page paint in colour pdfium's regeneration would lose?
+
+        Cached per page because callers erase region by region — the answer cannot change under them,
+        since removing art and drawing RGB text never introduce a colour space that was not there.
+        """
+        if getattr(self, "_fragile_color_cache", None) is None:
+            from . import _textstream
+            self._fragile_color_cache = _textstream.uses_fragile_color(
+                self.doc._bytes, self.index)
+        return self._fragile_color_cache
 
     def _erase(self, region, kinds: tuple[int, ...]) -> dict:
         self.doc._flush()   # operations apply strictly in call order

@@ -111,6 +111,38 @@ class _FontInfo:
         return (w0 * Tfs + Tc + (Tw if is_space else 0.0)) * Th
 
 
+def uses_fragile_color(pdf_bytes: bytes, page_index: int) -> bool:
+    """Whether this page paints in colour that pdfium's content regeneration would not round-trip.
+
+    FPDFPage_GenerateContent re-encodes colour through pdfium's own model, so anything outside
+    DeviceRGB/DeviceGray — CMYK, Separation/DeviceN, shadings, pattern fills — comes back solid black.
+    A page answering True must not be edited through object-level removal, whatever the edit is worth.
+    """
+    import io
+
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        page = pdf.pages[page_index]
+        for ins in pikepdf.parse_content_stream(page):
+            if isinstance(ins, pikepdf.ContentStreamInlineImage):
+                continue
+            op, o = str(ins.operator), ins.operands
+            if op in ("k", "K", "sh"):
+                return True
+            if op in ("cs", "CS") and o and str(o[0]) not in ("/DeviceRGB", "/DeviceGray"):
+                return True
+            if op in ("scn", "SCN") and o and isinstance(o[-1], pikepdf.Name):
+                return True
+    return False
+
+
+def _is_form_xobject(page, operands) -> bool:
+    """Whether a `Do` names a Form XObject — the one place glyphs hide from this walker."""
+    try:
+        return str(page.Resources.XObject[str(operands[0])].Subtype) == "/Form"
+    except Exception:      # noqa: BLE001 — a name we cannot resolve is not a form we could have walked
+        return False
+
+
 def erase_glyphs(pdf_bytes: bytes, page_index: int,
                  regions: list[tuple]) -> tuple[bytes, dict]:
     """Erase every glyph whose device box intersects any region (bottom-up device space).
@@ -118,7 +150,8 @@ def erase_glyphs(pdf_bytes: bytes, page_index: int,
     """
     import io
 
-    stats = {"ops_rewritten": 0, "glyphs": 0, "xobject_ops": 0}
+    stats = {"ops_rewritten": 0, "glyphs": 0, "xobject_ops": 0,
+             "form_xobject_ops": 0, "fragile_color": False}
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
         page = pdf.pages[page_index]
         fonts: dict[str, _FontInfo] = {}
@@ -174,6 +207,18 @@ def erase_glyphs(pdf_bytes: bytes, page_index: int,
                 Tm = Tlm
             elif op == "Do":
                 stats["xobject_ops"] += 1
+                if _is_form_xobject(page, o):
+                    stats["form_xobject_ops"] += 1
+
+            # Colour the object-level route would lose if it regenerated this stream.
+            # pdfium re-encodes colour through its own model, and anything outside DeviceRGB/DeviceGray
+            # comes back black: CMYK, Separation/DeviceN, shadings, pattern fills.
+            if op in ("k", "K", "sh"):
+                stats["fragile_color"] = True
+            elif op in ("cs", "CS") and o and str(o[0]) not in ("/DeviceRGB", "/DeviceGray"):
+                stats["fragile_color"] = True
+            elif op in ("scn", "SCN") and o and isinstance(o[-1], pikepdf.Name):
+                stats["fragile_color"] = True
 
             if op not in ("Tj", "TJ", "'", '"') or Tfs == 0:
                 out.append(ins)
