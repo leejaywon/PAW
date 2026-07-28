@@ -122,6 +122,7 @@ def uses_fragile_color(pdf_bytes: bytes, page_index: int) -> bool:
 
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
         page = pdf.pages[page_index]
+        # This scans only the page stream, so colour used solely inside a Form XObject is not detected.
         for ins in pikepdf.parse_content_stream(page):
             if isinstance(ins, pikepdf.ContentStreamInlineImage):
                 continue
