@@ -42,6 +42,12 @@ def fixture() -> bytes:
     c = canvas.Canvas(buf, pagesize=(300, 200))
     c.setFont("Helvetica", 12)
     c.drawString(30, 160, "KEEP TOP")
+    c.setFillColorRGB(0.2, 0.7, 0.3)
+    c.drawString(30, 130, "COLOR LEFT")
+    split_x = 30 + c.stringWidth("COLOR LEFT", "Helvetica", 12)
+    c.setFillColorRGB(0.9, 0.2, 0.1)
+    c.drawString(split_x, 130, " COLOR RIGHT")
+    c.setFillColorRGB(0, 0, 0)
     c.drawString(30, 100, "ERASE ME PLEASE")
     c.drawString(30, 40, "KEEP BOTTOM")
     c.line(30, 95, 110, 95)
@@ -77,11 +83,44 @@ def main() -> int:
           f"bbox={tuple(round(v, 1) for v in erase_span.bbox)} "
           f"font={erase_span.font} size={erase_span.size}" if erase_span else "no span")
 
+    colour_spans = [s for s in spans if "COLOR" in s.text or "RIGHT" in s.text]
+    colour_lines = [ln for ln in page.text_lines()
+                    if "COLOR LEFT COLOR RIGHT" in "".join(s.text for s in ln["spans"])]
+    check("  text_spans preserves colour runs",
+          len(colour_spans) == 2 and colour_spans[0].color != colour_spans[1].color,
+          f"{[(s.text, s.color) for s in colour_spans]}")
+    check("  text_lines preserves inline colour runs",
+          len(colour_lines) == 1 and len(colour_lines[0]["spans"]) == 2
+          and colour_lines[0]["spans"][0].color != colour_lines[0]["spans"][1].color,
+          f"{[(s.text, s.color) for s in colour_lines[0]['spans']] if colour_lines else []}")
+
     st0 = page.strokes()
     check("strokes()", len(st0) == 2,
           f"{len(st0)} — y={[round(s['y0'], 1) for s in st0]} (want 105, 110)")
     fl = page.fills()
     check("fills()", len(fl) >= 1, f"{len(fl)} — first={fl[0] if fl else None}")
+
+    scene = page.scene_objects()
+    scene_again = page.scene_objects()
+    yellow = next((o for o in scene if o.kind == "path"
+                   and o.fill_rgba is not None and o.fill_rgba[0] > 240
+                   and 180 < o.fill_rgba[1] < 230), None)
+    check("scene_objects()",
+          any(o.kind == "text" and "ERASE" in (o.text or "") for o in scene)
+          and yellow is not None
+          and [o.id for o in scene] == [o.id for o in scene_again],
+          f"{len(scene)} objects · ids={[o.id for o in scene]}")
+    check("  scene paint colour+geometry",
+          yellow is not None and yellow.paint_order == (len(scene) - 1,)
+          and 29 < yellow.bbox[1] < 31 and yellow.fill_rgba[3] == 255,
+          f"{yellow}")
+
+    layers = page.raster_layers(dpi=144, crisp=True)
+    from PIL import ImageChops
+    check("raster_layers()",
+          layers.removed_text_objects == 5 and layers.unreachable_text_objects == 0
+          and ImageChops.difference(layers.composite, layers.without_text).getbbox() is not None,
+          f"removed={layers.removed_text_objects} unreachable={layers.unreachable_text_objects}")
 
     img = page.raster(dpi=144)
     check("raster(dpi=144)", img.size == (600, 400), f"{img.size}")
@@ -135,6 +174,12 @@ def main() -> int:
     check("place_image → images()", len(ims) == 1 and abs(ims[0]["x0"] - 250) < 2
           and abs(ims[0]["y0"] - 20) < 2,
           f"{[{k: round(v, 1) if isinstance(v, float) else v for k, v in im.items()} for im in ims]}")
+    nested = p2.scene_objects()
+    nested_ko = next((o for o in nested if o.kind == "text" and "사업" in (o.text or "")), None)
+    check("scene_objects() Form children",
+          nested_ko is not None and bool(nested_ko.parent_ids)
+          and abs(nested_ko.bbox[0] - 30) < 2 and 88 < nested_ko.bbox[1] < 102,
+          f"{nested_ko}")
     p2.raster(dpi=150).save(OUT / "coverage.out.png")
     check("purity: no ERASE text anywhere",
           not any("ERASE" in s.text for s in spans2), "")

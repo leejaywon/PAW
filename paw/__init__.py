@@ -61,7 +61,8 @@ import pypdfium2.raw as _fp
 # True parallelism belongs to processes, not threads.
 _PDFIUM = threading.Lock()
 
-__all__ = ["open", "blank", "Document", "Page", "Font", "Span", "Rect"]
+__all__ = ["open", "blank", "Document", "Page", "Font", "Span", "SceneObject",
+           "LayerRender", "Rect"]
 
 _EPS = 0.5          # pt tolerance on containment — object bounds are loose
 
@@ -250,6 +251,113 @@ class Span:
     bbox: tuple[float, float, float, float]
 
 
+@dataclass(frozen=True)
+class SceneObject:
+    """One painted PDF object in stable paint order.
+
+    ``bbox`` is always in PAW's top-left frame, including children of Form
+    XObjects.  ``paint_order`` is the object's path through the page object
+    tree; it is stable while the source content streams stay unchanged and is
+    therefore a suitable source identifier for a translation/editor manifest.
+
+    Colours are the RGBA values PDFium resolves for display.  They preserve
+    opacity and paint intent without claiming to preserve the source PDF colour
+    space; callers that need DeviceCMYK/Separation identities must inspect the
+    content stream separately.
+    """
+
+    id: str
+    page: int
+    kind: str
+    bbox: tuple[float, float, float, float]
+    paint_order: tuple[int, ...]
+    parent_ids: tuple[str, ...] = ()
+    fill_rgba: tuple[int, int, int, int] | None = None
+    stroke_rgba: tuple[int, int, int, int] | None = None
+    stroke_width: float | None = None
+    matrix: tuple[float, float, float, float, float, float] | None = None
+    marked_content_id: int | None = None
+    text: str | None = None
+    font_size: float | None = None
+    path_fill_mode: int | None = None
+    path_stroke: bool | None = None
+
+
+@dataclass(frozen=True)
+class LayerRender:
+    """Rendered page plus the same page with removable text suppressed.
+
+    PDFium cannot regenerate a changed Form XObject stream after removing one
+    of its children.  Text nested in forms is therefore reported as
+    ``unreachable_text_objects`` and remains visible in ``without_text``.  The
+    explicit count prevents a background detector from treating that image as
+    a complete text-free ground truth.
+    """
+
+    composite: object
+    without_text: object
+    removed_text_objects: int
+    unreachable_text_objects: int
+
+
+_SCENE_KINDS = {
+    _fp.FPDF_PAGEOBJ_UNKNOWN: "unknown",
+    _fp.FPDF_PAGEOBJ_TEXT: "text",
+    _fp.FPDF_PAGEOBJ_PATH: "path",
+    _fp.FPDF_PAGEOBJ_IMAGE: "image",
+    _fp.FPDF_PAGEOBJ_SHADING: "shading",
+    _fp.FPDF_PAGEOBJ_FORM: "form",
+}
+
+
+def _scene_rgba(obj, getter) -> tuple[int, int, int, int] | None:
+    channels = [ctypes.c_uint() for _ in range(4)]
+    if not getter(obj, *(ctypes.byref(v) for v in channels)):
+        return None
+    return tuple(int(v.value) for v in channels)
+
+
+def _scene_matrix(obj) -> tuple[float, float, float, float, float, float] | None:
+    matrix = _fp.FS_MATRIX()
+    if not _fp.FPDFPageObj_GetMatrix(obj, ctypes.byref(matrix)):
+        return None
+    return tuple(float(v) for v in (matrix.a, matrix.b, matrix.c,
+                                    matrix.d, matrix.e, matrix.f))
+
+
+def _compose_matrix(outer: tuple[float, ...], inner: tuple[float, ...]) -> tuple[float, ...]:
+    """Return a matrix that applies ``inner`` first and ``outer`` second."""
+    oa, ob, oc, od, oe, of = outer
+    ia, ib, ic, id_, ie, iff = inner
+    return (oa * ia + oc * ib, ob * ia + od * ib,
+            oa * ic + oc * id_, ob * ic + od * id_,
+            oa * ie + oc * iff + oe, ob * ie + od * iff + of)
+
+
+def _scene_bbox(obj, height: float, ancestor: tuple[float, ...]) -> tuple[float, float, float, float] | None:
+    values = [ctypes.c_float() for _ in range(4)]
+    if not _fp.FPDFPageObj_GetBounds(obj, *(ctypes.byref(v) for v in values)):
+        return None
+    left, bottom, right, top = (float(v.value) for v in values)
+    a, b, c, d, e, f = ancestor
+    corners = [(a * x + c * y + e, b * x + d * y + f)
+               for x in (left, right) for y in (bottom, top)]
+    xs = [p[0] for p in corners]
+    ys = [p[1] for p in corners]
+    return (min(xs), height - max(ys), max(xs), height - min(ys))
+
+
+def _scene_text(obj, text_page) -> str | None:
+    length = _fp.FPDFTextObj_GetText(obj, text_page, None, 0)
+    if length <= 1:
+        return None
+    buf = (ctypes.c_ushort * length)()
+    got = _fp.FPDFTextObj_GetText(obj, text_page, buf, length)
+    if got <= 1:
+        return None
+    return bytes(buf).decode("utf-16-le", "replace").rstrip("\x00")
+
+
 def _route_glyphs(text: str, font: Font,
                   fallbacks: tuple[Font, ...]) -> list[tuple[Font, str]]:
     """Split `text` into (font, run) pieces, longest runs per covering font.
@@ -294,7 +402,9 @@ def _spans_of(chars: list) -> list[Span]:
     for ch in chars:
         if prev is not None and (
                 ch.get("fontname") != prev.get("fontname")
-                or abs(float(ch.get("size", 0)) - float(prev.get("size", 0))) > 0.1):
+                or abs(float(ch.get("size", 0)) - float(prev.get("size", 0))) > 0.1
+                or _color_tuple(ch.get("non_stroking_color"))
+                != _color_tuple(prev.get("non_stroking_color"))):
             close()
         run.append(ch)
         prev = ch
@@ -501,6 +611,138 @@ class Page:
                          max(int(c.x0 * k) + 1, round(c.x1 * k)),
                          max(int(c.y0 * k) + 1, round(c.y1 * k))))
 
+    def scene_objects(self) -> list[SceneObject]:
+        """Return the page's painted object tree in stable paint order.
+
+        Text, paths, images, shadings and Form XObjects all use the same
+        top-left page frame.  Form children are included after their parent and
+        carry ``parent_ids`` so a consumer can retain both the visual page
+        geometry and the content-stream boundary that controls editability.
+        """
+        self.doc._flush()
+        identity = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        out: list[SceneObject] = []
+        with _PDFIUM:
+            pdf = pdfium.PdfDocument(self.doc._bytes)
+            try:
+                page = pdf[self.index]
+                _, height = page.get_size()
+                text_page = page.get_textpage()
+                try:
+                    def walk(count: int, get_object, order: tuple[int, ...],
+                             parents: tuple[str, ...], ancestor: tuple[float, ...]) -> None:
+                        for index in range(count):
+                            obj = get_object(index)
+                            kind_id = _fp.FPDFPageObj_GetType(obj)
+                            path = (*order, index)
+                            object_id = f"p{self.index + 1}:" + ".".join(
+                                f"{part:04d}" for part in path)
+                            bbox = _scene_bbox(obj, height, ancestor)
+                            if bbox is None:
+                                continue
+                            width = ctypes.c_float()
+                            stroke_width = (float(width.value)
+                                            if _fp.FPDFPageObj_GetStrokeWidth(
+                                                obj, ctypes.byref(width)) else None)
+                            font_size = None
+                            text = None
+                            if kind_id == _fp.FPDF_PAGEOBJ_TEXT:
+                                size = ctypes.c_float()
+                                if _fp.FPDFTextObj_GetFontSize(obj, ctypes.byref(size)):
+                                    font_size = float(size.value)
+                                text = _scene_text(obj, text_page.raw)
+                            fill_mode = None
+                            path_stroke = None
+                            if kind_id == _fp.FPDF_PAGEOBJ_PATH:
+                                fill = ctypes.c_int()
+                                stroke = ctypes.c_int()
+                                if _fp.FPDFPath_GetDrawMode(
+                                        obj, ctypes.byref(fill), ctypes.byref(stroke)):
+                                    fill_mode = int(fill.value)
+                                    path_stroke = bool(stroke.value)
+                            mcid = _fp.FPDFPageObj_GetMarkedContentID(obj)
+                            out.append(SceneObject(
+                                id=object_id,
+                                page=self.index,
+                                kind=_SCENE_KINDS.get(kind_id, f"unknown-{kind_id}"),
+                                bbox=bbox,
+                                paint_order=path,
+                                parent_ids=parents,
+                                fill_rgba=_scene_rgba(obj, _fp.FPDFPageObj_GetFillColor),
+                                stroke_rgba=_scene_rgba(obj, _fp.FPDFPageObj_GetStrokeColor),
+                                stroke_width=stroke_width,
+                                matrix=_scene_matrix(obj),
+                                marked_content_id=(mcid if mcid >= 0 else None),
+                                text=text,
+                                font_size=font_size,
+                                path_fill_mode=fill_mode,
+                                path_stroke=path_stroke,
+                            ))
+                            if kind_id == _fp.FPDF_PAGEOBJ_FORM:
+                                matrix = _scene_matrix(obj) or identity
+                                child_ancestor = _compose_matrix(ancestor, matrix)
+                                walk(_fp.FPDFFormObj_CountObjects(obj),
+                                     lambda child_index, form=obj: _fp.FPDFFormObj_GetObject(
+                                         form, child_index),
+                                     path, (*parents, object_id), child_ancestor)
+
+                    walk(_fp.FPDFPage_CountObjects(page.raw),
+                         lambda index: _fp.FPDFPage_GetObject(page.raw, index),
+                         (), (), identity)
+                finally:
+                    text_page.close()
+            finally:
+                pdf.close()
+        return out
+
+    def raster_layers(self, dpi: int = 150, clip: Rect | tuple | None = None,
+                      crisp: bool = False) -> LayerRender:
+        """Render the normal page and a diagnostic copy without top-level text.
+
+        The second image exposes the composite pixels under ordinary text, so a
+        caller can measure backgrounds without sampling through glyph ink.
+        Form-XObject text remains and is counted explicitly because PDFium does
+        not regenerate modified Form streams when saving the page.
+        """
+        self.doc._flush()
+        composite = self.raster(dpi=dpi, clip=clip, crisp=crisp)
+        removed = 0
+        unreachable = 0
+        with _PDFIUM:
+            pdf = pdfium.PdfDocument(self.doc._bytes)
+            try:
+                page = pdf[self.index]
+
+                def count_form_text(form) -> int:
+                    count = 0
+                    for child_index in range(_fp.FPDFFormObj_CountObjects(form)):
+                        child = _fp.FPDFFormObj_GetObject(form, child_index)
+                        child_kind = _fp.FPDFPageObj_GetType(child)
+                        if child_kind == _fp.FPDF_PAGEOBJ_TEXT:
+                            count += 1
+                        elif child_kind == _fp.FPDF_PAGEOBJ_FORM:
+                            count += count_form_text(child)
+                    return count
+
+                for index in reversed(range(_fp.FPDFPage_CountObjects(page.raw))):
+                    obj = _fp.FPDFPage_GetObject(page.raw, index)
+                    kind = _fp.FPDFPageObj_GetType(obj)
+                    if kind == _fp.FPDF_PAGEOBJ_TEXT:
+                        if _fp.FPDFPage_RemoveObject(page.raw, obj):
+                            _fp.FPDFPageObj_Destroy(obj)
+                            removed += 1
+                    elif kind == _fp.FPDF_PAGEOBJ_FORM:
+                        unreachable += count_form_text(obj)
+                if removed:
+                    _fp.FPDFPage_GenerateContent(page.raw)
+                buf = io.BytesIO()
+                pdf.save(buf)
+            finally:
+                pdf.close()
+        without_text = Document(buf.getvalue())[self.index].raster(
+            dpi=dpi, clip=clip, crisp=crisp)
+        return LayerRender(composite, without_text, removed, unreachable)
+
     def text_spans(self) -> list[Span]:
         """Same-styled text runs with bbox, font, size, colour (top-left y-down)."""
         self.doc._flush()   # readers see every queued write
@@ -537,6 +779,8 @@ class Page:
                 brk = (prev is None
                        or ch.get("fontname") != prev.get("fontname")
                        or abs(float(ch.get("size", 0)) - float(prev.get("size", 0))) > 0.1
+                       or _color_tuple(ch.get("non_stroking_color"))
+                       != _color_tuple(prev.get("non_stroking_color"))
                        or abs(ch["top"] - prev["top"]) > 2.0        # new line
                        or ch["x0"] - prev["x1"] > float(prev.get("size", 12)))  # gap
                 if brk:

@@ -38,6 +38,8 @@ page.text_spans()              # text with font, size, colour, bbox
 page.strokes(); page.fills()   # vector art (gridlines, highlight bars)
 page.images()                  # placed images with bboxes
 page.raster(dpi=200)           # a PIL image of the page
+page.scene_objects()           # stable paint-order objects, including Form children
+page.raster_layers(dpi=150)    # composite + diagnostic render without top-level text
 
 # write — region is (x0, y0, x1, y1) in points, origin top-left, y down
 region = (72, 100, 300, 130)
@@ -61,6 +63,8 @@ baseline start.
 | `page.text_spans` · `page.text_lines`                                      | text with font, size, colour, bbox           |
 | `page.strokes` · `page.fills` · `page.images` · `page.links`               | vector art · fills · images · links          |
 | `page.raster(dpi)`                                                         | render the page to a PIL image               |
+| `page.scene_objects`                                                       | painted objects · Form ancestry · RGBA · IDs |
+| `page.raster_layers(dpi)`                                                  | composite · text-suppressed diagnostic render |
 | `page.erase_text` · `page.erase_art`                                       | remove text · path objects inside a region   |
 | `page.draw_text` · `page.draw_box` · `page.draw_rule` · `page.place_image` | draw onto the page                           |
 | `paw.Font.load`                                                            | load a TTF for measuring and drawing         |
