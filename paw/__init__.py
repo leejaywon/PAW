@@ -13,6 +13,7 @@ Every backend is permissively licensed; see NOTICE for the per-package licences.
     page.text_spans()              # read: text + font + size + colour + bbox
     page.strokes(); page.fills()   # read: vector art, for gridline clustering
     page.images()                  # read: placed images + bboxes
+    page.positioned_text_objects() # read: unmerged text + effective page style
     page.raster(dpi=200)           # read: PIL image of the page
 
     page.erase_text(region)        # write: text out of the content stream
@@ -45,6 +46,7 @@ from __future__ import annotations
 
 import ctypes
 import io
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -260,6 +262,11 @@ class SceneObject:
     tree; it is stable while the source content streams stay unchanged and is
     therefore a suitable source identifier for a translation/editor manifest.
 
+    ``matrix`` and ``font_size`` retain PDFium's local-object values for
+    compatibility.  ``effective_matrix`` composes the object matrix through
+    every enclosing Form XObject and converts it to PAW's top-left page frame;
+    ``effective_font_size`` is the resulting page-space vertical font scale.
+
     Colours are the RGBA values PDFium resolves for display.  They preserve
     opacity and paint intent without claiming to preserve the source PDF colour
     space; callers that need DeviceCMYK/Separation identities must inspect the
@@ -281,6 +288,10 @@ class SceneObject:
     font_size: float | None = None
     path_fill_mode: int | None = None
     path_stroke: bool | None = None
+    # Appended after the v0.2 fields so positional construction by existing
+    # callers keeps the same argument order.
+    effective_matrix: tuple[float, float, float, float, float, float] | None = None
+    effective_font_size: float | None = None
 
 
 @dataclass(frozen=True)
@@ -332,6 +343,19 @@ def _compose_matrix(outer: tuple[float, ...], inner: tuple[float, ...]) -> tuple
     return (oa * ia + oc * ib, ob * ia + od * ib,
             oa * ic + oc * id_, ob * ic + od * id_,
             oa * ie + oc * iff + oe, ob * ie + od * iff + of)
+
+
+def _page_matrix(matrix: tuple[float, ...], height: float) -> tuple[float, ...]:
+    """Convert a native PDF page matrix to PAW's top-left, y-down frame."""
+    return _compose_matrix((1.0, 0.0, 0.0, -1.0, 0.0, height), matrix)
+
+
+def _effective_font_size(size: float | None,
+                         matrix: tuple[float, ...] | None) -> float | None:
+    """Return the page-space length of the font's transformed vertical basis."""
+    if size is None or matrix is None:
+        return None
+    return float(size) * math.hypot(matrix[2], matrix[3])
 
 
 def _scene_bbox(obj, height: float, ancestor: tuple[float, ...]) -> tuple[float, float, float, float] | None:
@@ -634,6 +658,9 @@ class Page:
                         for index in range(count):
                             obj = get_object(index)
                             kind_id = _fp.FPDFPageObj_GetType(obj)
+                            local_matrix = _scene_matrix(obj) or identity
+                            effective_native = _compose_matrix(ancestor, local_matrix)
+                            effective_page = _page_matrix(effective_native, height)
                             path = (*order, index)
                             object_id = f"p{self.index + 1}:" + ".".join(
                                 f"{part:04d}" for part in path)
@@ -672,19 +699,20 @@ class Page:
                                 stroke_rgba=_scene_rgba(obj, _fp.FPDFPageObj_GetStrokeColor),
                                 stroke_width=stroke_width,
                                 matrix=_scene_matrix(obj),
+                                effective_matrix=effective_page,
                                 marked_content_id=(mcid if mcid >= 0 else None),
                                 text=text,
                                 font_size=font_size,
+                                effective_font_size=_effective_font_size(
+                                    font_size, effective_page),
                                 path_fill_mode=fill_mode,
                                 path_stroke=path_stroke,
                             ))
                             if kind_id == _fp.FPDF_PAGEOBJ_FORM:
-                                matrix = _scene_matrix(obj) or identity
-                                child_ancestor = _compose_matrix(ancestor, matrix)
                                 walk(_fp.FPDFFormObj_CountObjects(obj),
                                      lambda child_index, form=obj: _fp.FPDFFormObj_GetObject(
                                          form, child_index),
-                                     path, (*parents, object_id), child_ancestor)
+                                     path, (*parents, object_id), effective_native)
 
                     walk(_fp.FPDFPage_CountObjects(page.raw),
                          lambda index: _fp.FPDFPage_GetObject(page.raw, index),
@@ -694,6 +722,16 @@ class Page:
             finally:
                 pdf.close()
         return out
+
+    def positioned_text_objects(self) -> list[SceneObject]:
+        """Return unmerged painted text objects in stable paint order.
+
+        Unlike :meth:`text_lines`, this API performs no row, word, paragraph,
+        or table-cell merging.  Each returned object keeps its Form ancestry,
+        page-space bounding box, effective matrix, and effective font size so
+        document consumers can perform their own semantic grouping.
+        """
+        return [obj for obj in self.scene_objects() if obj.kind == "text"]
 
     def raster_layers(self, dpi: int = 150, clip: Rect | tuple | None = None,
                       crisp: bool = False) -> LayerRender:

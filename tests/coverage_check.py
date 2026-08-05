@@ -57,6 +57,15 @@ def fixture() -> bytes:
     c.showPage()
     c.setFont("Helvetica", 12)
     c.drawString(30, 100, "PAGE TWO")
+    c.beginForm("ScaledText", 0, 0, 100, 30)
+    c.setFont("Helvetica", 12)
+    c.drawString(10, 10, "FORM CHILD")
+    c.endForm()
+    c.saveState()
+    c.translate(80, 60)
+    c.scale(0.5, 0.5)
+    c.doForm("ScaledText")
+    c.restoreState()
     c.save()
     return buf.getvalue()
 
@@ -102,6 +111,7 @@ def main() -> int:
 
     scene = page.scene_objects()
     scene_again = page.scene_objects()
+    positioned = page.positioned_text_objects()
     yellow = next((o for o in scene if o.kind == "path"
                    and o.fill_rgba is not None and o.fill_rgba[0] > 240
                    and 180 < o.fill_rgba[1] < 230), None)
@@ -114,6 +124,29 @@ def main() -> int:
           yellow is not None and yellow.paint_order == (len(scene) - 1,)
           and 29 < yellow.bbox[1] < 31 and yellow.fill_rgba[3] == 255,
           f"{yellow}")
+    check("positioned_text_objects() is unmerged paint order",
+          [o.id for o in positioned] == [o.id for o in scene if o.kind == "text"]
+          and [o.text for o in positioned] == ["KEEP TOP", "COLOR LEFT ",
+                                                " COLOR RIGHT", "ERASE ME PLEASE",
+                                                "KEEP BOTTOM"],
+          f"{[(o.id, o.text) for o in positioned]}")
+    top = positioned[0] if positioned else None
+    check("  effective page matrix+font size",
+          top is not None and top.matrix is not None
+          and top.effective_matrix is not None
+          and abs((top.effective_font_size or 0) - 12) < 0.01
+          and abs(top.effective_matrix[4] - 30) < 0.01
+          and abs(top.effective_matrix[5] - 40) < 0.01,
+          f"{top}")
+    form_child = next((o for o in doc.pages[1].positioned_text_objects()
+                       if o.text == "FORM CHILD"), None)
+    check("  nested Form matrix composes into page space",
+          form_child is not None and bool(form_child.parent_ids)
+          and abs((form_child.effective_font_size or 0) - 6) < 0.01
+          and form_child.effective_matrix is not None
+          and abs(form_child.effective_matrix[0] - 0.5) < 0.01
+          and abs(form_child.effective_matrix[3] + 0.5) < 0.01,
+          f"{form_child}")
 
     layers = page.raster_layers(dpi=144, crisp=True)
     from PIL import ImageChops
@@ -175,10 +208,17 @@ def main() -> int:
           and abs(ims[0]["y0"] - 20) < 2,
           f"{[{k: round(v, 1) if isinstance(v, float) else v for k, v in im.items()} for im in ims]}")
     nested = p2.scene_objects()
+    positioned_nested = p2.positioned_text_objects()
     nested_ko = next((o for o in nested if o.kind == "text" and "사업" in (o.text or "")), None)
     check("scene_objects() Form children",
           nested_ko is not None and bool(nested_ko.parent_ids)
           and abs(nested_ko.bbox[0] - 30) < 2 and 88 < nested_ko.bbox[1] < 102,
+          f"{nested_ko}")
+    check("  Form effective matrix+font size",
+          nested_ko is not None and nested_ko.effective_matrix is not None
+          and nested_ko.effective_font_size is not None
+          and 10 < nested_ko.effective_font_size < 14
+          and any(o.id == nested_ko.id for o in positioned_nested),
           f"{nested_ko}")
     p2.raster(dpi=150).save(OUT / "coverage.out.png")
     check("purity: no ERASE text anywhere",
